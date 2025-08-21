@@ -1,1 +1,6 @@
+# Python-библиотеки для установки
+flask
+python-telegram-bot
+openai
+gunicorn
 
