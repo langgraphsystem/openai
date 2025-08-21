@@ -4,11 +4,10 @@
 import os
 import re
 import logging
-import asyncio
+import asyncio # We need this to bridge sync and async
 from flask import Flask, request
 from openai import OpenAI
 
-# NEW: Updated imports for python-telegram-bot v20+
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -22,7 +21,6 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o")
 if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
     raise ValueError("Необходимо установить переменные окружения: TELEGRAM_BOT_TOKEN и OPENAI_API_KEY")
 
-# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
@@ -34,12 +32,10 @@ if OPENAI_BASE_URL:
     client_args["base_url"] = OPENAI_BASE_URL
 client = OpenAI(**client_args)
 
-# NEW: Use Application.builder() to create the bot application
 application = Application.builder().token(TELEGRAM_TOKEN).build()
-
 app = Flask(__name__)
 
-# --- Основная логика генерации кода ---
+# --- Основная логика генерации кода (без изменений) ---
 
 def extract_code_block(text: str) -> str:
     """Извлекает код из блока ```...``` или возвращает весь текст."""
@@ -77,11 +73,9 @@ def generate_from_spec(model: str, spec: str, lang_hint: str = "python") -> str:
         logger.error(f"Ошибка при вызове OpenAI API: {e}")
         return f"Произошла ошибка при генерации кода: {e}"
 
-# --- Обработчики команд Telegram ---
-# NEW: Handler functions are now async
+# --- Обработчики команд Telegram (без изменений) ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправляет приветственное сообщение при команде /start."""
     user = update.effective_user
     welcome_message = (
         f"Привет, {user.first_name}!\n\n"
@@ -91,7 +85,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает текстовые сообщения как промпты для генерации кода."""
     prompt = update.message.text
     chat_id = update.message.chat_id
 
@@ -107,32 +100,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(generated_code)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Логирует ошибки."""
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
 # --- Настройка веб-хука и запуск Flask ---
 
+# !!! KEY CHANGE HERE !!!
 @app.route('/webhook', methods=['POST'])
-async def webhook():
+def webhook() -> str: # CHANGED: The function is now synchronous (def, not async def)
     """Этот эндпоинт принимает обновления от Telegram и обрабатывает их."""
     update_data = request.get_json(force=True)
     update = Update.de_json(update_data, application.bot)
     
-    # NEW: Process updates asynchronously
-    await application.process_update(update)
+    # CHANGED: We run the async function using asyncio.run()
+    asyncio.run(application.process_update(update))
+    
     return 'ok'
 
 @app.route('/')
 def index():
-    """Простая страница для проверки работоспособности сервиса."""
     return "I'm alive!"
 
-# NEW: Handlers are added to the application object
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 application.add_error_handler(error_handler)
 
 if __name__ == "__main__":
-    # Этот блок теперь используется только для локального запуска
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
