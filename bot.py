@@ -4,40 +4,40 @@
 import os
 import re
 import logging
+import asyncio
 from flask import Flask, request
 from openai import OpenAI
-from telegram import Update, Bot
-from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, CallbackContext
+
+# NEW: Updated imports for python-telegram-bot v20+
+from telegram import Update
 from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # --- Конфигурация ---
-# Получаем токены из переменных окружения (безопасный способ для Railway)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL") # Необязательно
-MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o") # Модель по умолчанию
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
+MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o")
 
-# Проверяем, что все необходимые переменные окружения установлены
 if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
     raise ValueError("Необходимо установить переменные окружения: TELEGRAM_BOT_TOKEN и OPENAI_API_KEY")
 
-# Настройка логирования для отладки
+# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # --- Инициализация клиентов ---
-# Инициализация клиента OpenAI
 client_args = {"api_key": OPENAI_API_KEY}
 if OPENAI_BASE_URL:
     client_args["base_url"] = OPENAI_BASE_URL
 client = OpenAI(**client_args)
 
-# Инициализация Flask приложения и Telegram бота
+# NEW: Use Application.builder() to create the bot application
+application = Application.builder().token(TELEGRAM_TOKEN).build()
+
 app = Flask(__name__)
-bot = Bot(token=TELEGRAM_TOKEN)
-dispatcher = Dispatcher(bot, None, use_context=True)
 
 # --- Основная логика генерации кода ---
 
@@ -63,14 +63,13 @@ def generate_from_spec(model: str, spec: str, lang_hint: str = "python") -> str:
     ])
 
     try:
-        # Используем новый стандартный API client.chat.completions.create
         completion = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.1, # Низкая температура для более предсказуемого кода
+            temperature=0.1,
         )
         text_content = completion.choices[0].message.content
         return extract_code_block(text_content)
@@ -79,55 +78,48 @@ def generate_from_spec(model: str, spec: str, lang_hint: str = "python") -> str:
         return f"Произошла ошибка при генерации кода: {e}"
 
 # --- Обработчики команд Telegram ---
+# NEW: Handler functions are now async
 
-def start(update: Update, context: CallbackContext) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет приветственное сообщение при команде /start."""
     user = update.effective_user
     welcome_message = (
         f"Привет, {user.first_name}!\n\n"
         f"Я бот для генерации кода. Просто отправь мне текстовое описание (промпт), "
-        f"и я сгенерирую для тебя код на Python, используя модель **{MODEL_NAME}**.\n\n"
-        "Например, отправь мне: `веб-сервер на Flask с одной страницей, который выводит 'Hello, World!'`"
+        f"и я сгенерирую для тебя код на Python, используя модель **{MODEL_NAME}**."
     )
-    update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
 
-def handle_message(update: Update, context: CallbackContext) -> None:
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает текстовые сообщения как промпты для генерации кода."""
     prompt = update.message.text
     chat_id = update.message.chat_id
 
-    # Сообщение о том, что запрос принят
-    context.bot.send_message(chat_id, text="⏳ Генерирую код по вашему запросу... Это может занять некоторое время.")
-
+    await context.bot.send_message(chat_id, text="⏳ Генерирую код по вашему запросу...")
     logger.info(f"Получен промпт от {update.effective_user.username}: {prompt}")
 
-    # Генерация кода
     generated_code = generate_from_spec(MODEL_NAME, prompt)
 
-    # Отправка результата
     try:
-        # Пытаемся отправить как отформатированный блок кода
-        update.message.reply_text(f"```python\n{generated_code}\n```", parse_mode=ParseMode.MARKDOWN_V2)
-    except Exception as e:
-        logger.warning(f"Не удалось отправить как Markdown: {e}. Отправляю как обычный текст.")
-        # Если не получилось (например, из-за спецсимволов), отправляем как простой текст
-        update.message.reply_text(generated_code)
+        await update.message.reply_text(f"```python\n{generated_code}\n```", parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception:
+        logger.warning("Не удалось отправить как Markdown. Отправляю как обычный текст.")
+        await update.message.reply_text(generated_code)
 
-def error_handler(update: object, context: CallbackContext) -> None:
-    """Логирует ошибки и отправляет сообщение пользователю."""
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Логирует ошибки."""
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
-    # Попытка уведомить пользователя об ошибке
-    if isinstance(update, Update):
-        update.message.reply_text("Произошла внутренняя ошибка. Попробуйте позже.")
-
 
 # --- Настройка веб-хука и запуск Flask ---
 
 @app.route('/webhook', methods=['POST'])
-def webhook():
-    """Этот эндпоинт принимает обновления от Telegram."""
-    update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
+async def webhook():
+    """Этот эндпоинт принимает обновления от Telegram и обрабатывает их."""
+    update_data = request.get_json(force=True)
+    update = Update.de_json(update_data, application.bot)
+    
+    # NEW: Process updates asynchronously
+    await application.process_update(update)
     return 'ok'
 
 @app.route('/')
@@ -135,29 +127,12 @@ def index():
     """Простая страница для проверки работоспособности сервиса."""
     return "I'm alive!"
 
-if __name__ == "__main__":
-    # Регистрация обработчиков
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-    dispatcher.add_error_handler(error_handler)
+# NEW: Handlers are added to the application object
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+application.add_error_handler(error_handler)
 
-    # Установка веб-хука. URL должен быть публичным (Railway предоставит его)
-    # ВАЖНО: Замените YOUR_RAILWAY_APP_URL на ваш реальный URL от Railway
-    # Например: https://my-cool-bot.up.railway.app
-    # Этот код нужно запустить один раз локально или через CLI Railway для установки хука
-    
-    # --- ЛОКАЛЬНЫЙ ЗАПУСК ДЛЯ ТЕСТИРОВАНИЯ ---
-    # Чтобы запустить локально:
-    # 1. Создайте файл .env с TELEGRAM_BOT_TOKEN и OPENAI_API_KEY
-    # 2. Установите ngrok: https://ngrok.com/
-    # 3. Запустите ngrok: ngrok http 5000
-    # 4. Скопируйте https URL от ngrok и установите веб-хук, раскомментировав строку ниже
-    # 5. Запустите этот скрипт: python bot.py
-    
-    # bot.set_webhook("YOUR_NGROK_OR_RAILWAY_URL/webhook")
-    
-    # Запуск веб-сервера. Railway автоматически подставит нужный порт.
+if __name__ == "__main__":
+    # Этот блок теперь используется только для локального запуска
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-
-
